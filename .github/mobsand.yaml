@@ -1,0 +1,281 @@
+name: "📥 دانلود حرفه‌ای (7z, 5-by-5 push)"
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup tools
+        run: sudo apt-get update && sudo apt-get install -y aria2 p7zip-full file
+
+      # ------------------------------------------------------------
+      # STEP 1 – Parse commit, download, and split
+      # ------------------------------------------------------------
+      - name: Parse & Download
+        id: download
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+
+          # ----- determine mode -----
+          if echo "$MSG" | grep -qP 'download-zip:'; then
+            MODE="zip"
+            REST=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
+          elif echo "$MSG" | grep -qP 'download:'; then
+            MODE="normal"
+            REST=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+          else
+            echo "❌ No valid command found"
+            exit 1
+          fi
+
+          # ----- default values -----
+          CUSTOM_NAME=""
+          SPLIT_SIZE="95m"
+          TARGET_DIR=""
+          URLS=()
+
+          # ----- parse flags and arguments -----
+          IFS=' ' read -ra ARGS <<< "$REST"
+          i=0
+          while [ $i -lt ${#ARGS[@]} ]; do
+            arg="${ARGS[$i]}"
+            case "$arg" in
+              --name)
+                i=$((i+1))
+                CUSTOM_NAME="${ARGS[$i]}"
+                ;;
+              --split)
+                i=$((i+1))
+                SPLIT_SIZE="${ARGS[$i]}"
+                ;;
+              http://*|https://*)
+                URLS+=("$arg")
+                ;;
+              *)
+                # if it's not a flag and doesn't start with http, it's the target directory
+                TARGET_DIR="$arg"
+                ;;
+            esac
+            i=$((i+1))
+          done
+
+          if [ ${#URLS[@]} -eq 0 ]; then
+            echo "❌ No URLs provided"
+            exit 1
+          fi
+
+          echo "Mode: $MODE"
+          echo "Custom name: ${CUSTOM_NAME:-none}"
+          echo "Split size: $SPLIT_SIZE"
+          echo "Target dir: ${TARGET_DIR:-auto}"
+          echo "URLs: ${URLS[@]}"
+
+          mkdir -p tmp_downloads
+
+          # ----- download each URL -----
+          for URL in "${URLS[@]}"; do
+            echo "⬇️ Downloading $URL"
+            if [ -n "$CUSTOM_NAME" ]; then
+              # Force custom name (user must include extension)
+              aria2c \
+                --split=2 \
+                --max-connection-per-server=2 \
+                --min-split-size=90M \
+                --out="$CUSTOM_NAME" \
+                --dir="tmp_downloads" \
+                "$URL"
+            else
+              # Let aria2c use Content-Disposition → correct filename + extension
+              aria2c \
+                --split=2 \
+                --max-connection-per-server=2 \
+                --min-split-size=90M \
+                --content-disposition \
+                --dir="tmp_downloads" \
+                "$URL"
+            fi
+          done
+
+          # ----- collect downloaded files (only those in tmp_downloads) -----
+          cd tmp_downloads
+          FILES=(*)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No files downloaded"
+            exit 1
+          fi
+
+          # ----- determine real file name (first file, if multiple in zip mode, we'll archive later) -----
+          # We'll handle the actual file names after any potential zipping.
+          cd ..
+
+          # ----- if normal mode and we have a single file, that file is our payload -----
+          # For zip mode, we'll compress all files together later.
+          if [ "$MODE" = "normal" ]; then
+            # In normal mode, typically one file. But we support multiple URLs → multiple files.
+            # We'll process each file individually (splitting if large).
+            for FILE in tmp_downloads/*; do
+              [ -f "$FILE" ] || continue
+              BASENAME=$(basename "$FILE")
+              SIZE=$(stat -c%s "$FILE")
+              THRESHOLD=$((90 * 1024 * 1024))
+              if [ "$SIZE" -gt "$THRESHOLD" ]; then
+                echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB → splitting"
+                # split with 7z, parts named BASENAME.7z.001 ...
+                cd tmp_downloads
+                7z a -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
+                rm "$BASENAME"
+                cd ..
+                # move parts to final destination
+                if [ -n "$TARGET_DIR" ]; then
+                  mkdir -p "$TARGET_DIR"
+                  mv tmp_downloads/"${BASENAME}.7z".* "$TARGET_DIR/" 2>/dev/null || true
+                else
+                  # auto-categorise
+                  EXT="${BASENAME##*.}"
+                  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+                  CAT="other"
+                  if [[ "$EXT_LOWER" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then CAT="video"
+                  elif [[ "$EXT_LOWER" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then CAT="audio"
+                  elif [[ "$EXT_LOWER" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then CAT="image"
+                  elif [[ "$EXT_LOWER" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then CAT="document"
+                  fi
+                  SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
+                  DEST="downloads/$CAT/$SAFE_DIR"
+                  mkdir -p "$DEST"
+                  mv tmp_downloads/"${BASENAME}.7z".* "$DEST/" 2>/dev/null || true
+                fi
+              else
+                # file small enough, just copy
+                if [ -n "$TARGET_DIR" ]; then
+                  mkdir -p "$TARGET_DIR"
+                  cp "$FILE" "$TARGET_DIR/$BASENAME"
+                else
+                  EXT="${BASENAME##*.}"
+                  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+                  CAT="other"
+                  if [[ "$EXT_LOWER" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then CAT="video"
+                  elif [[ "$EXT_LOWER" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then CAT="audio"
+                  elif [[ "$EXT_LOWER" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then CAT="image"
+                  elif [[ "$EXT_LOWER" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then CAT="document"
+                  fi
+                  SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
+                  DEST="downloads/$CAT/$SAFE_DIR"
+                  mkdir -p "$DEST"
+                  cp "$FILE" "$DEST/$BASENAME"
+                fi
+              fi
+            done
+          else
+            # MODE = zip → compress all files into one archive first
+            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
+            cd tmp_downloads
+            zip -j "../$ARCHIVE_NAME" *
+            cd ..
+            rm -rf tmp_downloads
+            mkdir tmp_downloads
+            mv "$ARCHIVE_NAME" tmp_downloads/
+            # Now process this single archive
+            FILE="tmp_downloads/$ARCHIVE_NAME"
+            BASENAME=$(basename "$FILE")
+            SIZE=$(stat -c%s "$FILE")
+            THRESHOLD=$((90 * 1024 * 1024))
+            if [ "$SIZE" -gt "$THRESHOLD" ]; then
+              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB → splitting"
+              cd tmp_downloads
+              7z a -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
+              rm "$BASENAME"
+              cd ..
+              if [ -n "$TARGET_DIR" ]; then
+                mkdir -p "$TARGET_DIR"
+                mv tmp_downloads/"${BASENAME}.7z".* "$TARGET_DIR/" 2>/dev/null || true
+              else
+                # categorize zip as 'other' or 'archive'
+                CAT="archive"
+                SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
+                DEST="downloads/$CAT/$SAFE_DIR"
+                mkdir -p "$DEST"
+                mv tmp_downloads/"${BASENAME}.7z".* "$DEST/" 2>/dev/null || true
+              fi
+            else
+              if [ -n "$TARGET_DIR" ]; then
+                mkdir -p "$TARGET_DIR"
+                cp "$FILE" "$TARGET_DIR/$BASENAME"
+              else
+                CAT="archive"
+                SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
+                DEST="downloads/$CAT/$SAFE_DIR"
+                mkdir -p "$DEST"
+                cp "$FILE" "$DEST/$BASENAME"
+              fi
+            fi
+          fi
+
+          # final cleanup
+          rm -rf tmp_downloads
+
+          # ----- export final target directory (or base for auto) -----
+          # We need to know where the files ended up so the push step can add them.
+          # If TARGET_DIR was set, it's that. Otherwise, files are in downloads/ somewhere.
+          # We'll pass a base path to the next step: either $TARGET_DIR or "downloads"
+          if [ -n "$TARGET_DIR" ]; then
+            echo "PUSH_BASE=$TARGET_DIR" >> $GITHUB_ENV
+          else
+            echo "PUSH_BASE=downloads" >> $GITHUB_ENV
+          fi
+
+      # ------------------------------------------------------------
+      # STEP 2 – Push exactly 5 files at a time
+      # ------------------------------------------------------------
+      - name: Push files in groups of 5
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Work from repo root
+          cd "$GITHUB_WORKSPACE"
+
+          # Find all new files under PUSH_BASE (recursive)
+          mapfile -t ALL_FILES < <(find "$PUSH_BASE" -type f)
+          TOTAL=${#ALL_FILES[@]}
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No files to push"
+            exit 0
+          fi
+          echo "Total files to push: $TOTAL"
+
+          BATCH=5
+          for (( i=0; i<TOTAL; i+=BATCH )); do
+            batch_files=""
+            for (( j=i; j<i+BATCH && j<TOTAL; j++ )); do
+              batch_files+="${ALL_FILES[$j]} "
+            done
+
+            # Unstage everything, then add only this batch
+            git reset HEAD -- . >/dev/null 2>&1 || true
+            git add $batch_files
+
+            batch_num=$(( i/BATCH + 1 ))
+            file_count=$(echo $batch_files | wc -w)
+            echo "📦 Committing batch $batch_num ($file_count files)"
+
+            git commit -m "Add files batch $batch_num [skip ci]" || echo "Nothing to commit"
+            echo "🚀 Pushing batch $batch_num…"
+            git push origin HEAD:"$BRANCH" || {
+              echo "Push failed, retrying after 5s"
+              sleep 5
+              git push origin HEAD:"$BRANCH"
+            }
+          done
+          echo "✅ All batches pushed"
