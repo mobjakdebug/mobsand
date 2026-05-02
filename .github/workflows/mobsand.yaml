@@ -1,33 +1,128 @@
-name: "📥 دانلود حرفه‌ای (7z, 5-by-5 push)"
+name: "📥 0x00 dl Pro"
+
 on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Target URLs (Separate with space, comma, or new line)'
+        required: true
+        type: string
+      quality:
+        description: 'Video Quality (for supported extractors)'
+        required: true
+        type: choice
+        options:
+          - '480p (MP4 format - Recommended for <95MB)'
+          - '720p (MP4 format)'
+          - '360p (MP4 format)'
+          - 'Audio (MP3 format)'
+          - 'Best (Highest available)'
+      password:
+        description: 'ZIP Password (Optional - No ZIP applied if empty & under 95MB)'
+        required: false
+        type: string
+        default: ''
+      custom_name:
+        description: 'Custom filename (Optional - include extension)'
+        required: false
+        type: string
+        default: ''
+      target_dir:
+        description: 'Target folder in repo (Optional - auto-categorizes if empty)'
+        required: false
+        type: string
+        default: ''
   push:
     branches:
       - "**"
 
 jobs:
-  download-and-split:
+  download-and-save:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: write
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
-      - name: Setup tools
-        run: sudo apt-get update && sudo apt-get install -y aria2 p7zip-full file
+      - name: Fast Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 ffmpeg p7zip-full file
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          curl -fsSL https://bun.com/install | bash
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      # ------------------------------------------------------------
-      # STEP 1 – Parse commit, download, and split
-      # ------------------------------------------------------------
-      - name: Parse & Download
-        id: download
+      - name: Setup YouTube Cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > youtube_cookies.txt
+          else
+            touch youtube_cookies.txt
+          fi
+
+      - name: Setup Bunkr script
+        run: |
+          cat << 'EOF' > bunkr.py
+          import os, sys, json, time, base64, requests
+          from math import floor
+          from itertools import cycle
+          from urllib.parse import urlparse
+
+          BUNKRR_API = "https://bunkr.cr/api/vs"
+          BUNKRR_DOMAINS = ("bunkr.si", "bunkr.fi", "bunkr.ru", "bunkr.cr", "bunkr.rip", "bunkrr.su")
+          BUNKRR_DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://get.bunkrr.su/"}
+          _offline_subs = set()
+
+          def is_bunkr_url(url): return any(dom in url for dom in BUNKRR_DOMAINS)
+          
+          def get_slug(url): return __import__("re").search(r"/([a-zA-Z0-9_-]+)$", url).group(1) if __import__("re").search(r"/([a-zA-Z0-9_-]+)$", url) else None
+          
+          def fetch_api(url):
+              slug = get_slug(url)
+              if not slug: return None
+              for dom in (BUNKRR_API.split("/")[2], *_offline_subs):
+                  try:
+                      resp = requests.post(f"https://{dom}/api/vs", json={"slug": slug}, headers=BUNKRR_DOWNLOAD_HEADERS, timeout=30)
+                      if resp.status_code == 200: return resp.json()
+                      if resp.status_code == 502: _offline_subs.add(dom)
+                  except: continue
+              return None
+
+          def decrypt(api_resp):
+              try:
+                  t, enc = api_resp["timestamp"], base64.b64decode(api_resp["url"])
+                  dec = bytearray(b ^ next(cycle(f"SECRET_KEY_{floor(t/3600)}".encode("utf-8"))) for b in enc)
+                  return dec.decode("utf-8", errors="ignore")
+              except: return None
+
+          if __name__ == "__main__":
+              url = sys.argv[1]
+              outdir = sys.argv[2]
+              api_resp = fetch_api(url)
+              dl_link = decrypt(api_resp) if api_resp else None
+              if dl_link:
+                  filepath = os.path.join(outdir, urlparse(dl_link).path.rstrip("/").split("/")[-1])
+                  resp = requests.get(dl_link, headers=BUNKRR_DOWNLOAD_HEADERS, stream=True)
+                  with open(filepath, "wb") as f:
+                      for c in resp.iter_content(8192): f.write(c) if c else None
+          EOF
+
+      - name: Parse commit message (for push trigger)
+        if: github.event_name == 'push'
+        id: parse_commit
         run: |
           MSG=$(git log -1 --pretty=%B)
           echo "Commit message: $MSG"
 
-          # ----- determine mode -----
           if echo "$MSG" | grep -qP 'download-zip:'; then
             MODE="zip"
             REST=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
@@ -35,17 +130,15 @@ jobs:
             MODE="normal"
             REST=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
           else
-            echo "❌ No valid command found"
-            exit 1
+            echo "No download command in commit, skipping parse"
+            exit 0
           fi
 
-          # ----- default values -----
           CUSTOM_NAME=""
           SPLIT_SIZE="95m"
           TARGET_DIR=""
           URLS=()
 
-          # ----- parse flags and arguments -----
           IFS=' ' read -ra ARGS <<< "$REST"
           i=0
           while [ $i -lt ${#ARGS[@]} ]; do
@@ -63,191 +156,166 @@ jobs:
                 URLS+=("$arg")
                 ;;
               *)
-                # if it's not a flag and doesn't start with http, it's the target directory
                 TARGET_DIR="$arg"
                 ;;
             esac
             i=$((i+1))
           done
 
-          if [ ${#URLS[@]} -eq 0 ]; then
-            echo "❌ No URLs provided"
-            exit 1
-          fi
+          echo "MODE=$MODE" >> $GITHUB_ENV
+          echo "CUSTOM_NAME=$CUSTOM_NAME" >> $GITHUB_ENV
+          echo "SPLIT_SIZE=$SPLIT_SIZE" >> $GITHUB_ENV
+          echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
+          echo "URLS=${URLS[@]}" >> $GITHUB_ENV
+          echo "IS_COMMIT_TRIGGER=true" >> $GITHUB_ENV
 
-          echo "Mode: $MODE"
-          echo "Custom name: ${CUSTOM_NAME:-none}"
-          echo "Split size: $SPLIT_SIZE"
-          echo "Target dir: ${TARGET_DIR:-auto}"
-          echo "URLs: ${URLS[@]}"
-
+      - name: Download & Process Files
+        shell: bash
+        run: |
+          rm -rf tmp_downloads
           mkdir -p tmp_downloads
 
-          # ----- download each URL -----
-          for URL in "${URLS[@]}"; do
-            echo "⬇️ Downloading $URL"
-            if [ -n "$CUSTOM_NAME" ]; then
-              # Force custom name (user must include extension)
-              aria2c \
-                --split=2 \
-                --max-connection-per-server=2 \
-                --min-split-size=90M \
-                --out="$CUSTOM_NAME" \
-                --dir="tmp_downloads" \
-                "$URL"
+          # Determine source of URLs (workflow_dispatch or commit)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_URLS="${{ github.event.inputs.url }}"
+            QUALITY="${{ github.event.inputs.quality }}"
+            CUSTOM_NAME="${{ github.event.inputs.custom_name }}"
+            TARGET_DIR="${{ github.event.inputs.target_dir }}"
+            SPLIT_SIZE="95m"
+            MODE="normal"
+            echo "IS_COMMIT_TRIGGER=false" >> $GITHUB_ENV
+          else
+            RAW_URLS="${{ env.URLS }}"
+            QUALITY="Best (Highest available)"
+            CUSTOM_NAME="${{ env.CUSTOM_NAME }}"
+            TARGET_DIR="${{ env.TARGET_DIR }}"
+            SPLIT_SIZE="${{ env.SPLIT_SIZE }}"
+            MODE="${{ env.MODE }}"
+          fi
+
+          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
+
+          # yt-dlp quality settings
+          if [[ "$QUALITY" == *"720p"* ]]; then
+            YTDLP_F="-f bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"480p"* ]]; then
+            YTDLP_F="-f bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"360p"* ]]; then
+            YTDLP_F="-f bestvideo[ext=mp4][height<=360]+bestaudio[ext=m4a]/best[ext=mp4][height<=360]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"Audio"* ]]; then
+            YTDLP_F="-x --audio-format mp3"
+          else
+            YTDLP_F="--merge-output-format mp4"
+          fi
+
+          for URL in $FORMATTED_URLS; do
+            if [ -z "$URL" ]; then continue; fi
+            
+            echo "==========================================="
+            echo "Processing URL: $URL"
+            echo "==========================================="
+
+            if echo "$URL" | grep -qE "(bunkr\.si|bunkr\.fi|bunkr\.ru|bunkr\.cr|bunkr\.rip|bunkrr\.su)"; then
+              echo "Downloading from Bunkr..."
+              python3 bunkr.py "$URL" "tmp_downloads"
+              
+            elif echo "$URL" | grep -qE "(youtube\.com|youtu\.be|twitch\.tv|reddit\.com|vimeo|soundcloud)"; then
+              echo "Downloading with yt-dlp..."
+              COOKIE_ARG=""
+              [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+              
+              if [ -n "$CUSTOM_NAME" ]; then
+                yt-dlp --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/$CUSTOM_NAME" "$URL"
+              else
+                yt-dlp --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
+              fi
+              
             else
-              # Let aria2c use Content-Disposition → correct filename + extension
-              aria2c \
-                --split=2 \
-                --max-connection-per-server=2 \
-                --min-split-size=90M \
-                --content-disposition \
-                --dir="tmp_downloads" \
-                "$URL"
+              echo "Downloading direct file with aria2..."
+              if [ -n "$CUSTOM_NAME" ]; then
+                aria2c --split=2 --max-connection-per-server=2 --min-split-size=90M --out="$CUSTOM_NAME" --dir="tmp_downloads" "$URL"
+              else
+                aria2c --split=2 --max-connection-per-server=2 --min-split-size=90M --content-disposition --dir="tmp_downloads" "$URL"
+              fi
             fi
           done
 
-          # ----- collect downloaded files (only those in tmp_downloads) -----
-          cd tmp_downloads
-          FILES=(*)
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "No files downloaded"
-            exit 1
-          fi
+          # Export for next steps
+          echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
+          echo "SPLIT_SIZE=$SPLIT_SIZE" >> $GITHUB_ENV
 
-          # ----- determine real file name (first file, if multiple in zip mode, we'll archive later) -----
-          # We'll handle the actual file names after any potential zipping.
-          cd ..
+      - name: Zip & Split with 7z
+        shell: bash
+        run: |
+          HAS_PASS="${{ github.event.inputs.password }}"
+          TARGET_DIR="${TARGET_DIR:-dl}"
+          SPLIT_SIZE="${SPLIT_SIZE:-95m}"
 
-          # ----- if normal mode and we have a single file, that file is our payload -----
-          # For zip mode, we'll compress all files together later.
-          if [ "$MODE" = "normal" ]; then
-            # In normal mode, typically one file. But we support multiple URLs → multiple files.
-            # We'll process each file individually (splitting if large).
-            for FILE in tmp_downloads/*; do
-              [ -f "$FILE" ] || continue
-              BASENAME=$(basename "$FILE")
-              SIZE=$(stat -c%s "$FILE")
-              THRESHOLD=$((90 * 1024 * 1024))
-              if [ "$SIZE" -gt "$THRESHOLD" ]; then
-                echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB → splitting"
-                # split with 7z, parts named BASENAME.7z.001 ...
-                cd tmp_downloads
-                7z a -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
-                rm "$BASENAME"
-                cd ..
-                # move parts to final destination
-                if [ -n "$TARGET_DIR" ]; then
-                  mkdir -p "$TARGET_DIR"
-                  mv tmp_downloads/"${BASENAME}.7z".* "$TARGET_DIR/" 2>/dev/null || true
-                else
-                  # auto-categorise
-                  EXT="${BASENAME##*.}"
-                  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-                  CAT="other"
-                  if [[ "$EXT_LOWER" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then CAT="video"
-                  elif [[ "$EXT_LOWER" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then CAT="audio"
-                  elif [[ "$EXT_LOWER" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then CAT="image"
-                  elif [[ "$EXT_LOWER" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then CAT="document"
-                  fi
-                  SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
-                  DEST="downloads/$CAT/$SAFE_DIR"
-                  mkdir -p "$DEST"
-                  mv tmp_downloads/"${BASENAME}.7z".* "$DEST/" 2>/dev/null || true
-                fi
-              else
-                # file small enough, just copy
-                if [ -n "$TARGET_DIR" ]; then
-                  mkdir -p "$TARGET_DIR"
-                  cp "$FILE" "$TARGET_DIR/$BASENAME"
-                else
-                  EXT="${BASENAME##*.}"
-                  EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-                  CAT="other"
-                  if [[ "$EXT_LOWER" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then CAT="video"
-                  elif [[ "$EXT_LOWER" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then CAT="audio"
-                  elif [[ "$EXT_LOWER" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then CAT="image"
-                  elif [[ "$EXT_LOWER" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then CAT="document"
-                  fi
-                  SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
-                  DEST="downloads/$CAT/$SAFE_DIR"
-                  mkdir -p "$DEST"
-                  cp "$FILE" "$DEST/$BASENAME"
-                fi
-              fi
-            done
-          else
-            # MODE = zip → compress all files into one archive first
-            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
-            cd tmp_downloads
-            zip -j "../$ARCHIVE_NAME" *
-            cd ..
-            rm -rf tmp_downloads
-            mkdir tmp_downloads
-            mv "$ARCHIVE_NAME" tmp_downloads/
-            # Now process this single archive
-            FILE="tmp_downloads/$ARCHIVE_NAME"
-            BASENAME=$(basename "$FILE")
+          mkdir -p "$TARGET_DIR"
+
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
             SIZE=$(stat -c%s "$FILE")
             THRESHOLD=$((90 * 1024 * 1024))
-            if [ "$SIZE" -gt "$THRESHOLD" ]; then
-              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB → splitting"
+            BASENAME=$(basename "$FILE")
+            
+            # Clean up old parts
+            rm -f "$TARGET_DIR/${BASENAME}.7z".* "$TARGET_DIR/${BASENAME}.zip" "$TARGET_DIR/${BASENAME}.z"*
+            
+            if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$THRESHOLD" ]; then
+              echo "📦 Splitting: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+              
+              # Use 7z for splitting (cleaner than zip split)
               cd tmp_downloads
-              7z a -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
+              if [ -n "$HAS_PASS" ]; then
+                7z a -p"$HAS_PASS" -mhe=on -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
+              else
+                7z a -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
+              fi
               rm "$BASENAME"
+              mv "${BASENAME}.7z".* "../$TARGET_DIR/"
               cd ..
-              if [ -n "$TARGET_DIR" ]; then
-                mkdir -p "$TARGET_DIR"
-                mv tmp_downloads/"${BASENAME}.7z".* "$TARGET_DIR/" 2>/dev/null || true
-              else
-                # categorize zip as 'other' or 'archive'
-                CAT="archive"
-                SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
-                DEST="downloads/$CAT/$SAFE_DIR"
-                mkdir -p "$DEST"
-                mv tmp_downloads/"${BASENAME}.7z".* "$DEST/" 2>/dev/null || true
-              fi
             else
-              if [ -n "$TARGET_DIR" ]; then
-                mkdir -p "$TARGET_DIR"
-                cp "$FILE" "$TARGET_DIR/$BASENAME"
-              else
-                CAT="archive"
-                SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
-                DEST="downloads/$CAT/$SAFE_DIR"
-                mkdir -p "$DEST"
-                cp "$FILE" "$DEST/$BASENAME"
-              fi
+              echo "📄 File under 95MB, copying raw: $BASENAME"
+              cp "$FILE" "$TARGET_DIR/$BASENAME"
             fi
-          fi
-
-          # final cleanup
+          done
           rm -rf tmp_downloads
 
-          # ----- export final target directory (or base for auto) -----
-          # We need to know where the files ended up so the push step can add them.
-          # If TARGET_DIR was set, it's that. Otherwise, files are in downloads/ somewhere.
-          # We'll pass a base path to the next step: either $TARGET_DIR or "downloads"
-          if [ -n "$TARGET_DIR" ]; then
-            echo "PUSH_BASE=$TARGET_DIR" >> $GITHUB_ENV
-          else
+          # Auto-categorize if no target_dir specified and not workflow_dispatch
+          if [ -z "$TARGET_DIR" ] || [ "$TARGET_DIR" = "dl" ]; then
+            # Move from dl/ to categorized folders
+            for FILE in dl/*; do
+              [ -f "$FILE" ] || continue
+              BASENAME=$(basename "$FILE")
+              EXT="${BASENAME##*.}"
+              EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+              CAT="other"
+              if [[ "$EXT_LOWER" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then CAT="video"
+              elif [[ "$EXT_LOWER" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then CAT="audio"
+              elif [[ "$EXT_LOWER" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then CAT="image"
+              elif [[ "$EXT_LOWER" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then CAT="document"
+              elif [[ "$EXT_LOWER" =~ ^(7z|zip|rar|z[0-9]+)$ ]]; then CAT="archive"
+              fi
+              SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
+              DEST="downloads/$CAT/$SAFE_DIR"
+              mkdir -p "$DEST"
+              mv "$FILE" "$DEST/"
+            done
             echo "PUSH_BASE=downloads" >> $GITHUB_ENV
+          else
+            echo "PUSH_BASE=$TARGET_DIR" >> $GITHUB_ENV
           fi
 
-      # ------------------------------------------------------------
-      # STEP 2 – Push exactly 5 files at a time
-      # ------------------------------------------------------------
       - name: Push files in groups of 5
         run: |
           BRANCH="${GITHUB_REF_NAME}"
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          git config user.name "NET-Sentinel Bot"
+          git config user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
 
-          # Work from repo root
           cd "$GITHUB_WORKSPACE"
 
-          # Find all new files under PUSH_BASE (recursive)
-          mapfile -t ALL_FILES < <(find "$PUSH_BASE" -type f)
+          mapfile -t ALL_FILES < <(find "$PUSH_BASE" -type f 2>/dev/null || find "dl" -type f 2>/dev/null)
           TOTAL=${#ALL_FILES[@]}
           if [ "$TOTAL" -eq 0 ]; then
             echo "No files to push"
@@ -262,7 +330,6 @@ jobs:
               batch_files+="${ALL_FILES[$j]} "
             done
 
-            # Unstage everything, then add only this batch
             git reset HEAD -- . >/dev/null 2>&1 || true
             git add $batch_files
 
