@@ -1,4 +1,4 @@
-name: "📥 mobsand"
+name: "📥 0x00 dl Pro"
 
 on:
   workflow_dispatch:
@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Fast Install Dependencies
         run: |
@@ -175,7 +175,6 @@ jobs:
           rm -rf tmp_downloads
           mkdir -p tmp_downloads
 
-          # Determine source of URLs (workflow_dispatch or commit)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             RAW_URLS="${{ github.event.inputs.url }}"
             QUALITY="${{ github.event.inputs.quality }}"
@@ -183,7 +182,6 @@ jobs:
             TARGET_DIR="${{ github.event.inputs.target_dir }}"
             SPLIT_SIZE="95m"
             MODE="normal"
-            echo "IS_COMMIT_TRIGGER=false" >> $GITHUB_ENV
           else
             RAW_URLS="${{ env.URLS }}"
             QUALITY="Best (Highest available)"
@@ -195,7 +193,6 @@ jobs:
 
           FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
 
-          # yt-dlp quality settings
           if [[ "$QUALITY" == *"720p"* ]]; then
             YTDLP_F="-f bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best --merge-output-format mp4"
           elif [[ "$QUALITY" == *"480p"* ]]; then
@@ -240,7 +237,6 @@ jobs:
             fi
           done
 
-          # Export for next steps
           echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
           echo "SPLIT_SIZE=$SPLIT_SIZE" >> $GITHUB_ENV
 
@@ -259,13 +255,11 @@ jobs:
             THRESHOLD=$((90 * 1024 * 1024))
             BASENAME=$(basename "$FILE")
             
-            # Clean up old parts
             rm -f "$TARGET_DIR/${BASENAME}.7z".* "$TARGET_DIR/${BASENAME}.zip" "$TARGET_DIR/${BASENAME}.z"*
             
             if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$THRESHOLD" ]; then
               echo "📦 Splitting: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
               
-              # Use 7z for splitting (cleaner than zip split)
               cd tmp_downloads
               if [ -n "$HAS_PASS" ]; then
                 7z a -p"$HAS_PASS" -mhe=on -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
@@ -282,9 +276,7 @@ jobs:
           done
           rm -rf tmp_downloads
 
-          # Auto-categorize if no target_dir specified and not workflow_dispatch
           if [ -z "$TARGET_DIR" ] || [ "$TARGET_DIR" = "dl" ]; then
-            # Move from dl/ to categorized folders
             for FILE in dl/*; do
               [ -f "$FILE" ] || continue
               BASENAME=$(basename "$FILE")
@@ -315,6 +307,14 @@ jobs:
 
           cd "$GITHUB_WORKSPACE"
 
+          # Pull latest to avoid "fetch first" rejections
+          echo "🔄 Syncing with remote before push..."
+          git pull --rebase origin "$BRANCH" 2>/dev/null || {
+            echo "⚠️ Rebase failed, force syncing..."
+            git fetch origin "$BRANCH" --depth=1
+            git reset --hard "origin/$BRANCH"
+          }
+
           mapfile -t ALL_FILES < <(find "$PUSH_BASE" -type f 2>/dev/null || find "dl" -type f 2>/dev/null)
           TOTAL=${#ALL_FILES[@]}
           if [ "$TOTAL" -eq 0 ]; then
@@ -330,6 +330,13 @@ jobs:
               batch_files+="${ALL_FILES[$j]} "
             done
 
+            # Pull before each batch to stay in sync
+            echo "🔄 Syncing before batch..."
+            git pull --rebase origin "$BRANCH" 2>/dev/null || {
+              git fetch origin "$BRANCH" --depth=1
+              git reset --hard "origin/$BRANCH"
+            }
+
             git reset HEAD -- . >/dev/null 2>&1 || true
             git add $batch_files
 
@@ -340,8 +347,11 @@ jobs:
             git commit -m "Add files batch $batch_num [skip ci]" || echo "Nothing to commit"
             echo "🚀 Pushing batch $batch_num…"
             git push origin HEAD:"$BRANCH" || {
-              echo "Push failed, retrying after 5s"
-              sleep 5
+              echo "⚠️ Push conflict, hard syncing and retrying..."
+              git fetch origin "$BRANCH" --depth=1
+              git reset --hard "origin/$BRANCH"
+              git add $batch_files
+              git commit -m "Add files batch $batch_num [skip ci]" || true
               git push origin HEAD:"$BRANCH"
             }
           done
