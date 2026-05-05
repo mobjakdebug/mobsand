@@ -1,4 +1,4 @@
-name: "📥 0x00 dl Pro"
+name: "📥 mobsand"
 
 on:
   workflow_dispatch:
@@ -255,7 +255,8 @@ jobs:
             THRESHOLD=$((90 * 1024 * 1024))
             BASENAME=$(basename "$FILE")
             
-            rm -f "$TARGET_DIR/${BASENAME}.7z".* "$TARGET_DIR/${BASENAME}.zip" "$TARGET_DIR/${BASENAME}.z"*
+            # Remove old parts if they exist
+            rm -f "$TARGET_DIR/${BASENAME}.7z."*
             
             if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$THRESHOLD" ]; then
               echo "📦 Splitting: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
@@ -267,6 +268,7 @@ jobs:
                 7z a -v"$SPLIT_SIZE" "${BASENAME}.7z" "$BASENAME"
               fi
               rm "$BASENAME"
+              # Move ALL parts to the SAME folder (flat, no subdirectories)
               mv "${BASENAME}.7z".* "../$TARGET_DIR/"
               cd ..
             else
@@ -275,28 +277,12 @@ jobs:
             fi
           done
           rm -rf tmp_downloads
-
-          if [ -z "$TARGET_DIR" ] || [ "$TARGET_DIR" = "dl" ]; then
-            for FILE in dl/*; do
-              [ -f "$FILE" ] || continue
-              BASENAME=$(basename "$FILE")
-              EXT="${BASENAME##*.}"
-              EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-              CAT="other"
-              if [[ "$EXT_LOWER" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then CAT="video"
-              elif [[ "$EXT_LOWER" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then CAT="audio"
-              elif [[ "$EXT_LOWER" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then CAT="image"
-              elif [[ "$EXT_LOWER" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then CAT="document"
-              elif [[ "$EXT_LOWER" =~ ^(7z|zip|rar|z[0-9]+)$ ]]; then CAT="archive"
-              fi
-              SAFE_DIR=$(echo "$BASENAME" | sed 's/[\\/:*?"<>|]/_/g')
-              DEST="downloads/$CAT/$SAFE_DIR"
-              mkdir -p "$DEST"
-              mv "$FILE" "$DEST/"
-            done
-            echo "PUSH_BASE=downloads" >> $GITHUB_ENV
+          
+          # Only auto-categorize if no custom target_dir was given AND it's not commit-triggered with explicit dir
+          if [ -z "${TARGET_DIR}" ] || [ "${TARGET_DIR}" = "dl" ]; then
+            echo "PUSH_BASE=dl" >> $GITHUB_ENV
           else
-            echo "PUSH_BASE=$TARGET_DIR" >> $GITHUB_ENV
+            echo "PUSH_BASE=${TARGET_DIR}" >> $GITHUB_ENV
           fi
 
       - name: Push files in groups of 5
@@ -307,13 +293,9 @@ jobs:
 
           cd "$GITHUB_WORKSPACE"
 
-          # Pull latest to avoid "fetch first" rejections
-          echo "🔄 Syncing with remote before push..."
-          git pull --rebase origin "$BRANCH" 2>/dev/null || {
-            echo "⚠️ Rebase failed, force syncing..."
-            git fetch origin "$BRANCH" --depth=1
-            git reset --hard "origin/$BRANCH"
-          }
+          echo "🔄 Syncing with remote..."
+          git fetch origin "$BRANCH" --depth=1
+          git reset --hard "origin/$BRANCH"
 
           mapfile -t ALL_FILES < <(find "$PUSH_BASE" -type f 2>/dev/null || find "dl" -type f 2>/dev/null)
           TOTAL=${#ALL_FILES[@]}
@@ -330,14 +312,10 @@ jobs:
               batch_files+="${ALL_FILES[$j]} "
             done
 
-            # Pull before each batch to stay in sync
-            echo "🔄 Syncing before batch..."
-            git pull --rebase origin "$BRANCH" 2>/dev/null || {
-              git fetch origin "$BRANCH" --depth=1
-              git reset --hard "origin/$BRANCH"
-            }
+            # Sync before each batch
+            git fetch origin "$BRANCH" --depth=1
+            git reset --hard "origin/$BRANCH"
 
-            git reset HEAD -- . >/dev/null 2>&1 || true
             git add $batch_files
 
             batch_num=$(( i/BATCH + 1 ))
@@ -347,12 +325,12 @@ jobs:
             git commit -m "Add files batch $batch_num [skip ci]" || echo "Nothing to commit"
             echo "🚀 Pushing batch $batch_num…"
             git push origin HEAD:"$BRANCH" || {
-              echo "⚠️ Push conflict, hard syncing and retrying..."
+              echo "⚠️ Push conflict, force syncing..."
               git fetch origin "$BRANCH" --depth=1
               git reset --hard "origin/$BRANCH"
               git add $batch_files
               git commit -m "Add files batch $batch_num [skip ci]" || true
-              git push origin HEAD:"$BRANCH"
+              git push --force-with-lease origin HEAD:"$BRANCH"
             }
           done
           echo "✅ All batches pushed"
