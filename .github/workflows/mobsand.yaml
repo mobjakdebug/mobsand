@@ -293,10 +293,14 @@ jobs:
 
           cd "$GITHUB_WORKSPACE"
 
-          echo "🔄 Syncing with remote..."
+          # ----- 1. Safely align with remote (do NOT delete new files) -----
+          echo "🔄 Fetching latest remote state..."
           git fetch origin "$BRANCH" --depth=1
-          git reset --hard "origin/$BRANCH"
 
+          # Soft reset: move HEAD to remote, keep working tree unchanged
+          git reset --soft "origin/$BRANCH" 2>/dev/null || true
+
+          # ----- 2. Gather new files into an array (respect spaces / Unicode) -----
           mapfile -t ALL_FILES < <(find "$PUSH_BASE" -type f 2>/dev/null || find "dl" -type f 2>/dev/null)
           TOTAL=${#ALL_FILES[@]}
           if [ "$TOTAL" -eq 0 ]; then
@@ -307,30 +311,38 @@ jobs:
 
           BATCH=5
           for (( i=0; i<TOTAL; i+=BATCH )); do
-            batch_files=""
+            # Build an array of exactly this batch's file paths
+            batch_files=()
             for (( j=i; j<i+BATCH && j<TOTAL; j++ )); do
-              batch_files+="${ALL_FILES[$j]} "
+              batch_files+=("${ALL_FILES[$j]}")
             done
 
-            # Sync before each batch
-            git fetch origin "$BRANCH" --depth=1
-            git reset --hard "origin/$BRANCH"
-
-            git add $batch_files
-
             batch_num=$(( i/BATCH + 1 ))
-            file_count=$(echo $batch_files | wc -w)
+            file_count=${#batch_files[@]}
             echo "📦 Committing batch $batch_num ($file_count files)"
 
+            # ----- 3. Sync again (stash new files → pull → pop) -----
+            git stash --include-untracked 2>/dev/null || true
+            git pull --rebase origin "$BRANCH" 2>/dev/null || {
+              echo "⚠️ Rebase failed, resetting to remote (preserving local files)..."
+              git reset --soft "origin/$BRANCH"
+            }
+            git stash pop 2>/dev/null || true
+
+            # ----- 4. Stage and commit using quoted array -----
+            git reset HEAD -- . >/dev/null 2>&1 || true
+            git add -- "${batch_files[@]}"
+
             git commit -m "Add files batch $batch_num [skip ci]" || echo "Nothing to commit"
+
             echo "🚀 Pushing batch $batch_num…"
             git push origin HEAD:"$BRANCH" || {
-              echo "⚠️ Push conflict, force syncing..."
+              echo "⚠️ Push conflict, force syncing and retrying..."
               git fetch origin "$BRANCH" --depth=1
-              git reset --hard "origin/$BRANCH"
-              git add $batch_files
+              git reset --soft "origin/$BRANCH"
+              git add -- "${batch_files[@]}"
               git commit -m "Add files batch $batch_num [skip ci]" || true
-              git push --force-with-lease origin HEAD:"$BRANCH"
+              git push origin HEAD:"$BRANCH"
             }
           done
           echo "✅ All batches pushed"
