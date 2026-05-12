@@ -55,16 +55,35 @@ jobs:
         run: |
           $url = "https://github.com/amirshaker000/netlify-relay/releases/download/v2.0.0/netlify-installer-v2.0.0.zip"
           $zipPath = "${{ runner.temp }}\netlify-installer.zip"
-          $extractPath = "${{ github.workspace }}"
+          $extractPath = "${{ runner.temp }}\netlify-extract"
           
           Write-Host "Downloading project files..."
           Invoke-WebRequest -Uri $url -OutFile $zipPath
           
+          Write-Host "Creating extract directory..."
+          New-Item -ItemType Directory -Force -Path $extractPath
+          
           Write-Host "Extracting project files..."
           Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
           
-          Write-Host "Project files downloaded and extracted successfully"
-          Get-ChildItem -Path $extractPath | Select-Object Name
+          Write-Host "Checking extracted files..."
+          Get-ChildItem -Path $extractPath -Recurse | Select-Object FullName
+          
+          # Check if files are in a subfolder
+          $packageJson = Get-ChildItem -Path $extractPath -Recurse -Filter "package.json" | Select-Object -First 1
+          
+          if ($packageJson) {
+            $sourceDir = $packageJson.DirectoryName
+            Write-Host "Found package.json in: $sourceDir"
+            Write-Host "Copying all files to workspace..."
+            Copy-Item -Path "$sourceDir\*" -Destination "${{ github.workspace }}" -Recurse -Force
+          } else {
+            Write-Host "package.json not found in extracted files!"
+            throw "package.json not found"
+          }
+          
+          Write-Host "Files in workspace:"
+          Get-ChildItem -Path "${{ github.workspace }}" | Select-Object Name
         shell: pwsh
 
       - name: Setup Node.js
@@ -72,8 +91,26 @@ jobs:
         with:
           node-version: '18'
 
+      - name: List workspace contents
+        run: |
+          Write-Host "Workspace contents:"
+          Get-ChildItem -Path "${{ github.workspace }}" -Recurse -Depth 1 | Select-Object FullName
+        shell: pwsh
+
       - name: Install dependencies
-        run: npm install
+        run: |
+          Write-Host "Current directory: $(Get-Location)"
+          Write-Host "Looking for package.json..."
+          if (Test-Path "package.json") {
+            Write-Host "package.json found!"
+            Get-Content package.json | Write-Host
+          } else {
+            Write-Host "package.json NOT found!"
+            Get-ChildItem | Select-Object Name
+            throw "package.json not found in current directory"
+          }
+          npm install --verbose
+        shell: pwsh
         working-directory: ${{ github.workspace }}
 
       - name: Deploy to Netlify
@@ -87,7 +124,14 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          .\Deploy-Netlify.ps1
+          if (Test-Path "Deploy-Netlify.ps1") {
+            Write-Host "Deploy-Netlify.ps1 found!"
+            .\Deploy-Netlify.ps1
+          } else {
+            Write-Host "Deploy-Netlify.ps1 NOT found!"
+            Get-ChildItem -Recurse -Filter "*.ps1" | Select-Object FullName
+            throw "Deploy-Netlify.ps1 not found"
+          }
 
       - name: Upload debug log
         if: always()
