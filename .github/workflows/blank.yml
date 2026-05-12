@@ -37,6 +37,10 @@ on:
         required: false
         type: string
         default: '/api'
+      netlify_auth_token:
+        description: 'Netlify Personal Access Token'
+        required: true
+        type: string
 
 jobs:
   deploy:
@@ -44,6 +48,7 @@ jobs:
     
     env:
       NON_INTERACTIVE: 'true'
+      NETLIFY_AUTH_TOKEN: ${{ inputs.netlify_auth_token }}
     
     steps:
       - name: Download project files
@@ -66,8 +71,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm'
-          cache-dependency-path: '${{ github.workspace }}/package-lock.json'
 
       - name: Install dependencies
         run: npm install
@@ -75,7 +78,6 @@ jobs:
 
       - name: Deploy to Netlify
         env:
-          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           INPUT_PROFILE: ${{ inputs.profile || '1' }}
           INPUT_TARGET_DOMAIN: ${{ inputs.target_domain }}
           INPUT_NETLIFY_SITE_NAME: ${{ inputs.site_name || '' }}
