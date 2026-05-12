@@ -1,0 +1,95 @@
+name: Deploy to Netlify
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Profile number (1-7)'
+        required: false
+        default: '1'
+        type: choice
+        options:
+          - '1' # EDGE LOW PING ECO
+          - '2' # EDGE LOW PING OPEN  
+          - '3' # EDGE LOW PING LONG
+          - '4' # FUNCTION ECO CREDITS
+          - '5' # FUNCTION BALANCED
+          - '6' # FUNCTION HIGH CONN
+          - '7' # FUNCTION MAX STABILITY
+      target_domain:
+        description: 'Target domain URL (e.g., https://your-domain.com:443)'
+        required: true
+        type: string
+      site_name:
+        description: 'Netlify site name (leave empty to auto-generate)'
+        required: false
+        type: string
+      site_id:
+        description: 'Existing Netlify site ID (leave empty to create new)'
+        required: false
+        type: string
+      relay_key:
+        description: 'RELAY_KEY (optional, leave empty to skip)'
+        required: false
+        type: string
+      public_relay_path:
+        description: 'Public relay path (default: /api)'
+        required: false
+        type: string
+        default: '/api'
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    
+    env:
+      NON_INTERACTIVE: 'true'
+    
+    steps:
+      - name: Download project files
+        run: |
+          $url = "https://github.com/amirshaker000/netlify-relay/releases/download/v2.0.0/netlify-installer-v2.0.0.zip"
+          $zipPath = "${{ runner.temp }}\netlify-installer.zip"
+          $extractPath = "${{ github.workspace }}"
+          
+          Write-Host "Downloading project files..."
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          
+          Write-Host "Extracting project files..."
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          
+          Write-Host "Project files downloaded and extracted successfully"
+          Get-ChildItem -Path $extractPath | Select-Object Name
+        shell: pwsh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: '${{ github.workspace }}/package-lock.json'
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: ${{ github.workspace }}
+
+      - name: Deploy to Netlify
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          INPUT_PROFILE: ${{ inputs.profile || '1' }}
+          INPUT_TARGET_DOMAIN: ${{ inputs.target_domain }}
+          INPUT_NETLIFY_SITE_NAME: ${{ inputs.site_name || '' }}
+          INPUT_NETLIFY_SITE_ID: ${{ inputs.site_id || '' }}
+          INPUT_RELAY_KEY: ${{ inputs.relay_key || '' }}
+          INPUT_PUBLIC_RELAY_PATH: ${{ inputs.public_relay_path || '/api' }}
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          .\Deploy-Netlify.ps1
+
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netlify-debug-log
+          path: ${{ github.workspace }}/netlify-installer-debug-*.log
